@@ -1,0 +1,5 @@
+logs
+*.log
+.skedda-profile
+node_modules
+.env.local
