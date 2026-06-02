@@ -743,6 +743,12 @@ async function saveScreenshot(page, label) {
 
 async function savePostConfirmScreenshot(page, label) {
   const file = path.join(logDir, `${runStamp}-${label}.png`)
+  const toastClip = await findToastClip(page).catch(() => null)
+  if (toastClip) {
+    await page.screenshot({ path: file, clip: toastClip })
+    return file
+  }
+
   const messages = page.locator(postConfirmMessageSelector())
   const count = await messages.count().catch(() => 0)
   for (let index = 0; index < Math.min(count, 12); index += 1) {
@@ -756,6 +762,60 @@ async function savePostConfirmScreenshot(page, label) {
   }
   await page.screenshot({ path: file, fullPage: false })
   return file
+}
+
+async function findToastClip(page) {
+  const viewport = page.viewportSize() || { width: 1440, height: 950 }
+  const box = await page.evaluate(() => {
+    function parseRgb(value) {
+      const match = String(value).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([.\d]+))?/)
+      if (!match) return null
+      return {
+        r: Number(match[1]),
+        g: Number(match[2]),
+        b: Number(match[3]),
+        a: match[4] === undefined ? 1 : Number(match[4]),
+      }
+    }
+    function isToastLikeColor(value) {
+      const rgb = parseRgb(value)
+      if (!rgb || rgb.a === 0) return false
+      const pinkError = rgb.r > 220 && rgb.g > 160 && rgb.g < 225 && rgb.b > 170 && rgb.b < 230
+      const greenSuccess = rgb.g > 180 && rgb.r < 210 && rgb.b > 160 && rgb.b < 230
+      return pinkError || greenSuccess
+    }
+
+    return Array.from(document.querySelectorAll('body *'))
+      .map((el) => {
+        const rect = el.getBoundingClientRect()
+        const style = getComputedStyle(el)
+        const text = (el.innerText || el.textContent || '').trim()
+        return {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+          text,
+          backgroundColor: style.backgroundColor,
+          colorMatch: isToastLikeColor(style.backgroundColor),
+        }
+      })
+      .filter((item) => item.width > 250 && item.height > 24 && item.height < 120 && item.y >= 0 && item.y < 140)
+      .filter((item) => item.colorMatch || /too easy|booking is in|sorry|didn'?t go through|couldn/i.test(item.text))
+      .sort((a, b) => {
+        const aTextScore = /too easy|booking is in|sorry|didn'?t go through|couldn/i.test(a.text) ? 0 : 1
+        const bTextScore = /too easy|booking is in|sorry|didn'?t go through|couldn/i.test(b.text) ? 0 : 1
+        return aTextScore - bTextScore || b.width - a.width
+      })[0] || null
+  })
+  if (!box) return null
+
+  const padding = 8
+  const x = Math.max(0, Math.floor(box.x - padding))
+  const y = Math.max(0, Math.floor(box.y - padding))
+  const width = Math.min(viewport.width - x, Math.ceil(box.width + padding * 2))
+  const height = Math.min(viewport.height - y, Math.ceil(box.height + padding * 2))
+  return width > 0 && height > 0 ? { x, y, width, height } : null
 }
 
 function postConfirmMessageSelector() {
