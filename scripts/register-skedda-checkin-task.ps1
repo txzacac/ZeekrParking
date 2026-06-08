@@ -2,22 +2,24 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $node = (Get-Command node -ErrorAction Stop).Source
-$taskName = "SkeddaParkingBooking"
-$scriptPath = Join-Path $repoRoot "scripts\skedda-booking.mjs"
+$taskName = "SkeddaParkingCheckIn"
+$scriptPath = Join-Path $repoRoot "scripts\skedda-checkin.mjs"
+$runnerPath = Join-Path $repoRoot "scripts\run-skedda-checkin.ps1"
 
 if (-not (Test-Path $scriptPath)) {
   throw "Could not find $scriptPath"
 }
+if (-not (Test-Path $runnerPath)) {
+  throw "Could not find $runnerPath"
+}
 
+$skipDates = "2026-06-08"
 $action = New-ScheduledTaskAction `
-  -Execute $node `
-  -Argument "`"$scriptPath`"" `
+  -Execute "powershell.exe" `
+  -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`" -SkipDates $skipDates" `
   -WorkingDirectory $repoRoot
 
-$triggers = @(
-  (New-ScheduledTaskTrigger -Daily -At 7:30AM),
-  (New-ScheduledTaskTrigger -Daily -At 7:31AM)
-)
+$trigger = New-ScheduledTaskTrigger -Daily -At 6:35AM
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
   -DontStopIfGoingOnBatteries `
@@ -27,11 +29,11 @@ $settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask `
   -TaskName $taskName `
   -Action $action `
-  -Trigger $triggers `
+  -Trigger $trigger `
   -Settings $settings `
-  -Description "Book Zeekr Skedda parking for the next workday at 07:30-18:00. Run at 07:30, then retry at 07:31 if the first run did not confirm." `
+  -Description "Check in to today's Zeekr Skedda parking booking at 06:35." `
   -Force | Out-Null
 
 Write-Host "Registered scheduled task: $taskName"
-Write-Host "Runs daily at 07:30 and 07:31 from: $repoRoot"
+Write-Host "Runs daily at 06:35 from: $repoRoot"
 Write-Host "Before relying on it, run: npm run skedda:login"

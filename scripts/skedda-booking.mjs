@@ -14,16 +14,16 @@ const logDir = path.join(rootDir, 'logs', 'skedda')
 const venueBaseUrl = 'https://zeekr.skedda.com/booking'
 const viewMapId = process.env.SKEDDA_VIEW_MAP_ID || '0c5eaf6404d2464aa4df03abe4cad93c'
 const timezone = process.env.SKEDDA_TIMEZONE || 'Europe/Amsterdam'
-const targetStart = process.env.SKEDDA_START_TIME || '08:00'
+const targetStart = process.env.SKEDDA_START_TIME || '07:30'
 const targetEnd = process.env.SKEDDA_END_TIME || '18:00'
 const carMake = process.env.SKEDDA_CAR_MAKE || 'tesla'
 const carModel = process.env.SKEDDA_CAR_MODEL || 'model y'
 const licensePlate = process.env.SKEDDA_LICENSE_PLATE || 'GGV-99-J'
-const preferredSpaces = (process.env.SKEDDA_PREFERRED_SPACES || 'Z15,Z16,Z17,Z8,Z9,Z11,Z12,Z13,Z14')
+const preferredSpaces = (process.env.SKEDDA_PREFERRED_SPACES || '4,5,6,18,17,15,25,24,23,22,21,20,19')
   .split(',')
   .map((space) => space.trim().toUpperCase())
   .filter(Boolean)
-const preferredSpacePrefixes = (process.env.SKEDDA_PREFERRED_SPACE_PREFIXES || 'Z')
+const preferredSpacePrefixes = (process.env.SKEDDA_PREFERRED_SPACE_PREFIXES || '')
   .split(',')
   .map((prefix) => prefix.trim().toUpperCase())
   .filter(Boolean)
@@ -56,6 +56,14 @@ if (target.skipped) {
   })
   process.exit(0)
 }
+
+const successMarkerPath = path.join(logDir, `success-${target.date}.json`)
+if (!dryRun && await fileExists(successMarkerPath)) {
+  await log(`Success marker exists for ${target.date}; skipping this retry run.`)
+  process.exit(0)
+}
+
+await log(`This run will try ${target.date} ${targetStart}-${targetEnd}.`)
 
 const browserSession = await openBrowserSession()
 const { context, page, connectedToExistingBrowser } = browserSession
@@ -105,6 +113,9 @@ try {
       attachments: screenshotPath ? [screenshotPath] : [],
       lines: result.lines,
     })
+    if (result.status === 'confirmed') {
+      await writeSuccessMarker(result)
+    }
     shouldKeepBrowserOpen = result.confirmClicked
   } else {
     await log('Booking flow skipped.')
@@ -402,7 +413,12 @@ async function attemptPriorityBookings(page, bookingUrl) {
     await prepareBookingMap(page, bookingUrl)
     await clickSpaceCandidate(page, candidate)
     await page.waitForTimeout(1_200)
-    await clickBookForStart(page, targetStart)
+    const bookingOpened = await clickBookForStart(page, targetStart)
+    if (!bookingOpened) {
+      attempts.push(`${candidate.name}: no Book for ${targetStart} option`)
+      await log(`${candidate.name} has no Book for ${targetStart} option; trying next priority space.`)
+      continue
+    }
     await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {})
     await page.waitForTimeout(1_000)
     await setEndTime(page, targetEnd)
@@ -482,7 +498,7 @@ async function findBookableSpaceCandidates(page, bookingUrl) {
   await prepareBookingMap(page, bookingUrl)
   const mapped = await mapPreferredSpacesFromMapGeometry(page)
   for (const candidate of mapped) {
-    await log(`Mapped priority space ${candidate.name} to green dot at ${Math.round(candidate.x)},${Math.round(candidate.y)}.`)
+    await log(`Mapped priority space ${candidate.name} to candidate point at ${Math.round(candidate.x)},${Math.round(candidate.y)}.`)
   }
   return mapped
 }
@@ -492,10 +508,6 @@ async function mapPreferredSpacesFromMapGeometry(page) {
     function parseRgb(value) {
       const match = String(value).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/)
       return match ? match.slice(1, 4).map(Number) : null
-    }
-    function isZeekrRed(value) {
-      const rgb = parseRgb(value)
-      return Boolean(rgb && rgb[0] > 170 && rgb[0] < 230 && rgb[1] > 30 && rgb[1] < 90 && rgb[2] < 40)
     }
     function isAvailableGreen(value) {
       const rgb = parseRgb(value)
@@ -517,23 +529,41 @@ async function mapPreferredSpacesFromMapGeometry(page) {
     }
 
     const nodes = Array.from(document.querySelectorAll('*'))
-    const redRects = nodes
+    const topLabels = ['25', '24', '23', '22', '21', '20', '19', '18', '17', '16', '15', '14', '13', '12', '11', '10']
+    const bottomLabels = ['1', '2', '3', '4', '5', '6', '7', '8', '9']
+    const parkingRects = nodes
       .filter((el) => el.tagName.toLowerCase() === 'rect')
       .map((el) => {
         const box = rectOf(el)
         return { ...box, fill: getComputedStyle(el).fill }
       })
-      .filter((box) => box.width > 60 && box.width < 140 && box.height > 140 && box.height < 240 && isZeekrRed(box.fill))
+      .filter((box) => box.width > 60 && box.width < 180 && box.height > 140 && box.height < 340)
 
-    const topRow = redRects
-      .filter((box) => box.y < 330)
-      .sort((a, b) => a.x - b.x)
-      .map((box, index) => ({ ...box, name: `Z${index + 8}` }))
+    const yBuckets = []
+    for (const box of parkingRects.sort((a, b) => a.y - b.y || a.x - b.x)) {
+      const bucket = yBuckets.find((row) => Math.abs(row.y - box.y) < 80)
+      if (bucket) {
+        bucket.boxes.push(box)
+        bucket.y = bucket.boxes.reduce((sum, item) => sum + item.y, 0) / bucket.boxes.length
+      } else {
+        yBuckets.push({ y: box.y, boxes: [box] })
+      }
+    }
 
-    const bottomRow = redRects
-      .filter((box) => box.y >= 330)
+    const rows = yBuckets
+      .filter((row) => row.boxes.length >= 3)
+      .sort((a, b) => a.y - b.y)
+      .slice(0, 2)
+
+    const topRow = (rows[0]?.boxes || [])
       .sort((a, b) => a.x - b.x)
-      .map((box, index) => ({ ...box, name: `Z${index + 15}` }))
+      .slice(0, topLabels.length)
+      .map((box, index) => ({ ...box, name: topLabels[index] }))
+
+    const bottomRow = (rows[1]?.boxes || [])
+      .sort((a, b) => a.x - b.x)
+      .slice(0, bottomLabels.length)
+      .map((box, index) => ({ ...box, name: bottomLabels[index] }))
 
     const spacesByName = new Map([...topRow, ...bottomRow].map((space) => [space.name, space]))
     const greenDots = nodes
@@ -552,7 +582,7 @@ async function mapPreferredSpacesFromMapGeometry(page) {
         .filter((candidate) => candidate.x >= space.left - 5 && candidate.x <= space.right + 5
           && candidate.y >= space.top - 5 && candidate.y <= space.bottom + 5)
         .sort((a, b) => Math.hypot(a.x - space.x, a.y - space.y) - Math.hypot(b.x - space.x, b.y - space.y))[0]
-      return dot ? { name, x: dot.x, y: dot.y } : null
+      return dot ? { name, x: dot.x, y: dot.y } : { name, x: space.x, y: space.y }
     }).filter(Boolean)
   }, { spaces: preferredSpaces })
 }
@@ -607,13 +637,13 @@ function sortByPreferredRectIndices(candidates) {
 async function clickBookForStart(page, time) {
   const text = await visibleText(page)
   if (text.includes('New booking') && (text.includes(`From ${time}`) || page.url().includes(`nbstart=`))) {
-    return
+    return true
   }
 
   const preferred = page.getByRole('button', { name: `Book for ${time}`, exact: true })
   if (await preferred.count()) {
     await preferred.first().click()
-    return
+    return true
   }
 
   const startOption = page.getByRole('button', { name: time, exact: true })
@@ -625,16 +655,16 @@ async function clickBookForStart(page, time) {
   const anyBook = page.getByRole('button', { name: /^Book for / })
   if (await anyBook.count()) {
     await anyBook.first().click()
-    return
+    return true
   }
 
   await page.waitForTimeout(2_000)
   const settledText = await visibleText(page)
   if (settledText.includes('New booking') && (settledText.includes(`From ${time}`) || page.url().includes('nbstart='))) {
-    return
+    return true
   }
 
-  throw new Error(`Could not find a Book for ${time} button.`)
+  return false
 }
 
 async function setEndTime(page, time) {
@@ -842,6 +872,23 @@ async function finish({ status, subject, lines, attachments = [] }) {
   await sendMail(subject, body, attachments)
 }
 
+async function writeSuccessMarker(result) {
+  const payload = {
+    targetDate: target.date,
+    time: `${targetStart}-${targetEnd}`,
+    status: result.status,
+    subject: result.subject,
+    screenshotPath: result.screenshotPath || null,
+    run: new Date().toISOString(),
+  }
+  await fs.writeFile(successMarkerPath, JSON.stringify(payload, null, 2), 'utf8')
+  await log(`Wrote success marker: ${successMarkerPath}`)
+}
+
+async function fileExists(filePath) {
+  return fs.access(filePath).then(() => true).catch(() => false)
+}
+
 async function sendMail(subject, body, attachmentPaths = []) {
   const configs = []
   if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
@@ -923,3 +970,4 @@ function stampForFilename(date) {
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
+
