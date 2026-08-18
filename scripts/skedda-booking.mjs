@@ -16,10 +16,13 @@ const viewMapId = process.env.SKEDDA_VIEW_MAP_ID || '0c5eaf6404d2464aa4df03abe4c
 const timezone = process.env.SKEDDA_TIMEZONE || 'Europe/Amsterdam'
 const targetStart = process.env.SKEDDA_START_TIME || '07:30'
 const targetEnd = process.env.SKEDDA_END_TIME || '18:00'
-const carMake = process.env.SKEDDA_CAR_MAKE || 'tesla'
-const carModel = process.env.SKEDDA_CAR_MODEL || 'model y'
-const licensePlate = process.env.SKEDDA_LICENSE_PLATE || 'GGV-99-J'
-const preferredSpaces = (process.env.SKEDDA_PREFERRED_SPACES || '4,5,6,18,17,15,25,24,23,22,21,20,19')
+const carMake = process.env.SKEDDA_CAR_MAKE || 'your car make'
+const carModel = process.env.SKEDDA_CAR_MODEL || 'your car model'
+const licensePlate = process.env.SKEDDA_LICENSE_PLATE || 'YOUR-PLATE'
+const args = new Set(process.argv.slice(2))
+const madMode = args.has('--mad') || args.has('--aggressive') || args.has('--crazy')
+  || ['1', 'true', 'yes'].includes((process.env.SKEDDA_MAD_MODE || '').toLowerCase())
+const preferredSpaces = (process.env.SKEDDA_PREFERRED_SPACES || '12,13,14,15,16,17,18,19,20,21,22,23,24,25')
   .split(',')
   .map((space) => space.trim().toUpperCase())
   .filter(Boolean)
@@ -35,6 +38,25 @@ const headless = (process.env.SKEDDA_HEADLESS || 'false').toLowerCase() !== 'fal
 const dryRun = ['1', 'true', 'yes'].includes((process.env.SKEDDA_DRY_RUN || '').toLowerCase())
 const keepBrowserOpen = ['1', 'true', 'yes'].includes((process.env.SKEDDA_KEEP_BROWSER_OPEN || 'true').toLowerCase())
 const browserDebugPort = Number(process.env.SKEDDA_BROWSER_DEBUG_PORT || 9223)
+const spaceClickSettleMs = Number(process.env.SKEDDA_SPACE_CLICK_SETTLE_MS || 450)
+const noBookSettleMs = Number(process.env.SKEDDA_NO_BOOK_SETTLE_MS || 700)
+const aggressiveSpaces = (process.env.SKEDDA_AGGRESSIVE_SPACES || '')
+  .split(',')
+  .map((space) => space.trim().toUpperCase())
+  .filter(Boolean)
+const madParallelSpaces = (process.env.SKEDDA_MAD_PARALLEL_SPACES || (aggressiveSpaces.length ? aggressiveSpaces.join(',') : preferredSpaces.join(',')))
+  .split(',')
+  .map((space) => space.trim().toUpperCase())
+  .filter(Boolean)
+const madParallelLimit = Number(process.env.SKEDDA_MAD_PARALLEL_LIMIT || 3)
+const madParallelBookWaitMs = Number(process.env.SKEDDA_MAD_PARALLEL_BOOK_WAIT_MS || 90_000)
+const bookingClickTime = process.env.SKEDDA_CLICK_TIME || targetStart
+const aggressiveWindowMs = Number(process.env.SKEDDA_AGGRESSIVE_WINDOW_MS || (madMode ? 90_000 : 12_000))
+const aggressiveClickSettleMs = Number(process.env.SKEDDA_AGGRESSIVE_CLICK_SETTLE_MS || 180)
+const aggressiveNoBookSettleMs = Number(process.env.SKEDDA_AGGRESSIVE_NO_BOOK_SETTLE_MS || 120)
+const aggressiveCloseWaitMs = Number(process.env.SKEDDA_AGGRESSIVE_CLOSE_WAIT_MS || 20)
+const aggressiveParallel = madMode
+  && ['1', 'true', 'yes'].includes((process.env.SKEDDA_AGGRESSIVE_PARALLEL || 'true').toLowerCase())
 
 await fs.mkdir(logDir, { recursive: true })
 const runStamp = stampForFilename(new Date())
@@ -63,14 +85,24 @@ if (!dryRun && await fileExists(successMarkerPath)) {
   process.exit(0)
 }
 
-await log(`This run will try ${target.date} ${targetStart}-${targetEnd}.`)
+await log(`This run will try ${target.date} ${targetStart}-${targetEnd}. Click time: ${bookingClickTime}.`)
 
-const browserSession = await openBrowserSession()
-const { context, page, connectedToExistingBrowser } = browserSession
+let context = null
+let page = null
+let connectedToExistingBrowser = false
 let screenshotPath = null
 let shouldKeepBrowserOpen = false
 
 try {
+  const browserSession = await withTimeout(
+    openBrowserSession(),
+    Number(process.env.SKEDDA_OPEN_BROWSER_TIMEOUT_MS || 60_000),
+    'Opening or connecting to the Skedda Chrome browser timed out'
+  )
+  context = browserSession.context
+  page = browserSession.page
+  connectedToExistingBrowser = browserSession.connectedToExistingBrowser
+
   page.setDefaultTimeout(Number(process.env.SKEDDA_TIMEOUT_MS || 20_000))
 
   const bookingUrl = buildBookingUrl(target.date)
@@ -105,7 +137,7 @@ try {
   }
 
   if (!process.exitCode) {
-    const result = await attemptPriorityBookings(page, bookingUrl)
+    const result = await attemptPriorityBookings(context, page, bookingUrl)
     screenshotPath = result.screenshotPath
     await finish({
       status: result.status,
@@ -121,7 +153,7 @@ try {
     await log('Booking flow skipped.')
   }
 } catch (error) {
-  screenshotPath = screenshotPath || await saveScreenshot(page, 'error').catch(() => null)
+  screenshotPath = screenshotPath || (page ? await saveScreenshot(page, 'error').catch(() => null) : null)
   await finish({
     status: 'error',
     subject: 'Skedda error',
@@ -141,7 +173,7 @@ try {
     await log('SKEDDA_KEEP_BROWSER_OPEN=true; leaving browser open to preserve the SSO session.')
     await new Promise(() => {})
   } else {
-    await context.close().catch(() => {})
+    await context?.close().catch(() => {})
   }
 }
 
@@ -184,6 +216,12 @@ async function openBrowserSession() {
     stdio: 'ignore',
     windowsHide: false,
   })
+  child.once('error', (error) => {
+    log(`Detached Chrome spawn error: ${error?.message || error}`).catch(() => {})
+  })
+  child.once('exit', (code, signal) => {
+    log(`Detached Chrome exited before/while CDP connection was opening. code=${code} signal=${signal}`).catch(() => {})
+  })
   child.unref()
   await waitForCdpEndpoint(endpoint)
 
@@ -196,11 +234,21 @@ async function openBrowserSession() {
 async function waitForCdpEndpoint(endpoint) {
   const deadline = Date.now() + Number(process.env.SKEDDA_CDP_START_TIMEOUT_MS || 30_000)
   while (Date.now() < deadline) {
-    const ok = await fetch(`${endpoint}/json/version`).then((response) => response.ok).catch(() => false)
+    const ok = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(1_500) })
+      .then((response) => response.ok)
+      .catch(() => false)
     if (ok) return
     await new Promise((resolve) => setTimeout(resolve, 500))
   }
   throw new Error(`Chrome did not expose CDP at ${endpoint}.`)
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${message} after ${timeoutMs}ms`)), timeoutMs)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }
 
 function nextBookingTarget(now) {
@@ -398,7 +446,7 @@ async function openFirstBookableGreenSpace(page) {
   throw new Error(`Found ${candidates.length} clickable spaces, but no ${preferredSpacePrefixes.join('/')} space opened a booking popover.`)
 }
 
-async function attemptPriorityBookings(page, bookingUrl) {
+async function attemptPriorityBookings(context, page, bookingUrl) {
   const candidates = await findBookableSpaceCandidates(page, bookingUrl)
   if (!candidates.length) {
     throw new Error(`No bookable spaces found for priority list: ${preferredSpaces.join(', ')}`)
@@ -407,32 +455,78 @@ async function attemptPriorityBookings(page, bookingUrl) {
   const attempts = []
   let lastScreenshotPath = null
   let lastText = ''
+  let confirmClickedAny = false
+  const madParallelSet = new Set(madParallelSpaces)
+  const madParallelCandidates = madMode
+    ? candidates.filter((candidate) => madParallelSet.has(candidate.name)).slice(0, madParallelLimit)
+    : []
+  const madParallelCandidateNames = new Set(madParallelCandidates.map((candidate) => candidate.name))
+  const fallbackCandidates = madMode
+    ? candidates.filter((candidate) => !madParallelCandidateNames.has(candidate.name))
+    : candidates
+  const madParallelRunners = madMode && aggressiveParallel
+    ? await prepareParallelBookingRunners(context, bookingUrl, madParallelCandidates)
+    : []
 
-  for (const candidate of candidates) {
-    await log(`Trying ${candidate.name} by clicking green dot at ${Math.round(candidate.x)},${Math.round(candidate.y)}.`)
-    await prepareBookingMap(page, bookingUrl)
-    await clickSpaceCandidate(page, candidate)
-    await page.waitForTimeout(1_200)
-    const bookingOpened = await clickBookForStart(page, targetStart)
+  await waitUntilBookingClickTime(bookingClickTime)
+
+  async function tryCandidate(activePage, candidate, mode, options = {}) {
+    const clickSettleMs = options.clickSettleMs ?? spaceClickSettleMs
+    const bookSettleMs = options.bookSettleMs ?? noBookSettleMs
+    const closeWaitMs = options.closeWaitMs ?? 100
+    const allowAnyBook = options.allowAnyBook ?? true
+    const prepareOnly = options.prepareOnly ?? false
+    const waitForExactBookMs = options.waitForExactBookMs ?? 0
+
+    await log(`Trying ${candidate.name} (${mode}) by clicking green dot at ${Math.round(candidate.x)},${Math.round(candidate.y)}.`)
+    await clickSpaceCandidate(activePage, candidate)
+    await activePage.waitForTimeout(clickSettleMs)
+    const bookingOpened = await clickBookForStart(activePage, targetStart, { settleMs: bookSettleMs, allowAnyBook, waitForExactBookMs })
     if (!bookingOpened) {
-      attempts.push(`${candidate.name}: no Book for ${targetStart} option`)
-      await log(`${candidate.name} has no Book for ${targetStart} option; trying next priority space.`)
-      continue
+      const reason = mode.startsWith('aggressive')
+        ? `no Book for ${targetStart} during ${mode}`
+        : await describeCurrentBookingBlock(activePage, targetStart)
+      attempts.push(`${candidate.name} [${mode}]: ${reason}`)
+      await log(`${candidate.name} skipped (${mode}): ${reason}; trying next priority space.`)
+      await closeOpenPopover(activePage, closeWaitMs)
+      return null
     }
-    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {})
-    await page.waitForTimeout(1_000)
-    await setEndTime(page, targetEnd)
-    await fillVehicleDetails(page)
 
-    const beforeConfirmText = await visibleText(page)
+    await activePage.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {})
+    await activePage.waitForTimeout(1_000)
+    try {
+      await setEndTime(activePage, targetEnd)
+      await fillVehicleDetails(activePage)
+    } catch (error) {
+      const reason = `booking form could not be completed (${error?.message || error})`
+      attempts.push(`${candidate.name} [${mode}]: ${reason}`)
+      await log(`${candidate.name} skipped (${mode}): ${reason}; trying next priority space.`)
+      await cancelDraftBooking(activePage)
+      return null
+    }
+
+    const beforeConfirmText = await visibleText(activePage)
     if (!beforeConfirmText.includes('Confirm booking')) {
-      attempts.push(`${candidate.name}: could not reach Confirm booking`)
-      await cancelDraftBooking(page)
-      continue
+      const reason = `could not reach Confirm booking (${summarizeBookingText(beforeConfirmText, targetStart)})`
+      attempts.push(`${candidate.name} [${mode}]: ${reason}`)
+      await log(`${candidate.name} skipped (${mode}): ${reason}; trying next priority space.`)
+      await cancelDraftBooking(activePage)
+      return null
+    }
+
+    if (prepareOnly) {
+      attempts.push(`${candidate.name} [${mode}]: draft ready`)
+      await log(`${candidate.name} prepared booking draft (${mode}); waiting for serial confirmation.`)
+      return {
+        status: 'draft-ready',
+        page: activePage,
+        candidate,
+        mode,
+      }
     }
 
     if (dryRun) {
-      lastScreenshotPath = await saveScreenshot(page, 'dry-run-ready')
+      lastScreenshotPath = await saveScreenshot(activePage, 'dry-run-ready')
       return {
         status: 'dry-run',
         subject: 'Skedda dry run ready',
@@ -441,20 +535,28 @@ async function attemptPriorityBookings(page, bookingUrl) {
         lines: [
           `Dry run reached Confirm booking for ${target.date} ${targetStart}-${targetEnd}.`,
           `Space: ${candidate.name}`,
+          `Mode: ${mode}`,
           `Priority order: ${preferredSpaces.join(', ')}`,
+          `Mad mode: ${madMode ? 'on' : 'off'}`,
+          `Mad parallel spaces: ${madParallelSpaces.join(', ')}`,
+          `Mad parallel limit: ${madParallelLimit}`,
+          `Mad parallel book wait: ${madParallelBookWaitMs}ms`,
+          `Click time: ${bookingClickTime}`,
           `Screenshot: ${lastScreenshotPath}`,
         ],
       }
     }
 
-    await clickUniqueButton(page, 'Confirm booking')
-    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {})
-    await waitForPostConfirmMessage(page, beforeConfirmText)
+    await clickUniqueButton(activePage, 'Confirm booking')
+    confirmClickedAny = true
+    await activePage.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {})
+    await waitForPostConfirmMessage(activePage, beforeConfirmText)
 
-    lastText = await visibleText(page)
-    lastScreenshotPath = await savePostConfirmScreenshot(page, `after-confirm-${candidate.name}`)
+    lastText = await visibleText(activePage)
+    lastScreenshotPath = await savePostConfirmScreenshot(activePage, `after-confirm-${candidate.name}`)
     const outcome = classifyOutcome(lastText)
-    attempts.push(`${candidate.name}: ${outcome.message}`)
+    attempts.push(`${candidate.name} [${mode}]: ${outcome.message}`)
+    await log(`${candidate.name} after Confirm booking (${mode}): ${outcome.message}`)
 
     if (outcome.success) {
       return {
@@ -462,9 +564,11 @@ async function attemptPriorityBookings(page, bookingUrl) {
         subject: `Skedda ${outcome.subject}`,
         screenshotPath: lastScreenshotPath,
         confirmClicked: true,
+        bookedSpace: outcome.bookedSpace || candidate.name,
         lines: [
           `Clicked Confirm booking for ${target.date} ${targetStart}-${targetEnd}.`,
-          `Successful space: ${candidate.name}`,
+          `Successful space: ${outcome.bookedSpace || candidate.name}`,
+          `Mode: ${mode}`,
           `Outcome: ${outcome.message}`,
           `Attempts: ${attempts.join(' | ')}`,
           `Screenshot: ${lastScreenshotPath}`,
@@ -474,17 +578,59 @@ async function attemptPriorityBookings(page, bookingUrl) {
       }
     }
 
-    await log(`${candidate.name} did not succeed; trying next priority space.`)
-    await cancelDraftBooking(page)
+    await log(`${candidate.name} did not succeed (${mode}); trying next priority space.`)
+    await cancelDraftBooking(activePage)
+    return null
+  }
+
+  if (madMode && madParallelCandidates.length) {
+    await log(`Mad parallel mode started for ${madParallelCandidates.map((candidate) => candidate.name).join(', ')} (${madParallelRunners.length ? 'parallel tabs' : 'single tab fallback'}).`)
+    if (madParallelRunners.length) {
+      const drafts = (await Promise.all(madParallelRunners.map((runner) => tryCandidate(
+        runner.page,
+        runner.candidate,
+        `mad parallel ${runner.candidate.name}`,
+        {
+          clickSettleMs: aggressiveClickSettleMs,
+          bookSettleMs: aggressiveNoBookSettleMs,
+          closeWaitMs: aggressiveCloseWaitMs,
+          allowAnyBook: false,
+          prepareOnly: true,
+          waitForExactBookMs: madParallelBookWaitMs,
+        },
+      )))).filter(Boolean)
+
+      for (const draft of drafts) {
+        const result = await confirmPreparedDraft(draft)
+        if (result) {
+          await closeParallelRunners(madParallelRunners.filter((runner) => runner.page !== draft.page))
+          return result
+        }
+      }
+      await closeParallelRunners(madParallelRunners)
+    } else {
+      for (const candidate of madParallelCandidates) {
+        const result = await tryCandidate(page, candidate, 'mad parallel single-tab')
+        if (result) return result
+      }
+    }
+    await log(`Mad parallel phase ended; falling back to ${fallbackCandidates.map((candidate) => candidate.name).join(', ')}.`)
+  }
+
+  for (const candidate of fallbackCandidates) {
+    const result = await tryCandidate(page, candidate, 'fallback')
+    if (result) return result
   }
 
   return {
-    status: 'confirm-clicked-no-success',
-    subject: 'Skedda confirm clicked, no success',
+    status: confirmClickedAny ? 'confirm-clicked-no-success' : 'no-bookable-priority-space',
+    subject: confirmClickedAny ? 'Skedda confirm clicked, no success' : 'Skedda no bookable priority space',
     screenshotPath: lastScreenshotPath,
-    confirmClicked: true,
+    confirmClicked: confirmClickedAny,
     lines: [
-      `Clicked Confirm booking for ${target.date} ${targetStart}-${targetEnd}, but no priority space produced the success popup.`,
+      confirmClickedAny
+        ? `Clicked Confirm booking for ${target.date} ${targetStart}-${targetEnd}, but no priority space produced the success popup.`
+        : `No priority space exposed a Book for ${targetStart} option for ${target.date} ${targetStart}-${targetEnd}.`,
       `Priority order: ${preferredSpaces.join(', ')}`,
       `Attempts: ${attempts.join(' | ')}`,
       lastScreenshotPath ? `Screenshot: ${lastScreenshotPath}` : '',
@@ -492,15 +638,114 @@ async function attemptPriorityBookings(page, bookingUrl) {
       clipText(lastText, 1800),
     ].filter(Boolean),
   }
+
+  async function confirmPreparedDraft(draft) {
+    const activePage = draft.page
+    const candidate = draft.candidate
+    const mode = draft.mode
+
+    if (dryRun) {
+      lastScreenshotPath = await saveScreenshot(activePage, 'dry-run-ready')
+      return {
+        status: 'dry-run',
+        subject: 'Skedda dry run ready',
+        screenshotPath: lastScreenshotPath,
+        confirmClicked: false,
+        lines: [
+          `Dry run reached Confirm booking for ${target.date} ${targetStart}-${targetEnd}.`,
+          `Space: ${candidate.name}`,
+          `Mode: ${mode}`,
+          `Priority order: ${preferredSpaces.join(', ')}`,
+          `Mad mode: ${madMode ? 'on' : 'off'}`,
+          `Mad parallel spaces: ${madParallelSpaces.join(', ')}`,
+          `Mad parallel limit: ${madParallelLimit}`,
+          `Mad parallel book wait: ${madParallelBookWaitMs}ms`,
+          `Click time: ${bookingClickTime}`,
+          `Screenshot: ${lastScreenshotPath}`,
+        ],
+      }
+    }
+
+    const beforeConfirmText = await visibleText(activePage)
+    if (!beforeConfirmText.includes('Confirm booking')) {
+      const reason = `prepared draft lost Confirm booking (${summarizeBookingText(beforeConfirmText, targetStart)})`
+      attempts.push(`${candidate.name} [${mode}]: ${reason}`)
+      await log(`${candidate.name} skipped (${mode}): ${reason}; trying next prepared draft.`)
+      await cancelDraftBooking(activePage)
+      return null
+    }
+
+    await clickUniqueButton(activePage, 'Confirm booking')
+    confirmClickedAny = true
+    await activePage.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {})
+    await waitForPostConfirmMessage(activePage, beforeConfirmText)
+
+    lastText = await visibleText(activePage)
+    lastScreenshotPath = await savePostConfirmScreenshot(activePage, `after-confirm-${candidate.name}`)
+    const outcome = classifyOutcome(lastText)
+    attempts.push(`${candidate.name} [${mode}]: ${outcome.message}`)
+    await log(`${candidate.name} after Confirm booking (${mode}): ${outcome.message}`)
+
+    if (outcome.success) {
+      return {
+        status: outcome.status,
+        subject: `Skedda ${outcome.subject}`,
+        screenshotPath: lastScreenshotPath,
+        confirmClicked: true,
+        bookedSpace: outcome.bookedSpace || candidate.name,
+        lines: [
+          `Clicked Confirm booking for ${target.date} ${targetStart}-${targetEnd}.`,
+          `Successful space: ${outcome.bookedSpace || candidate.name}`,
+          `Mode: ${mode}`,
+          `Outcome: ${outcome.message}`,
+          `Attempts: ${attempts.join(' | ')}`,
+          `Screenshot: ${lastScreenshotPath}`,
+          '',
+          clipText(lastText, 1800),
+        ],
+      }
+    }
+
+    await log(`${candidate.name} did not succeed (${mode}); trying next prepared draft.`)
+    await cancelDraftBooking(activePage)
+    return null
+  }
 }
 
 async function findBookableSpaceCandidates(page, bookingUrl) {
   await prepareBookingMap(page, bookingUrl)
   const mapped = await mapPreferredSpacesFromMapGeometry(page)
   for (const candidate of mapped) {
-    await log(`Mapped priority space ${candidate.name} to candidate point at ${Math.round(candidate.x)},${Math.round(candidate.y)}.`)
+    await log(`Mapped priority space ${candidate.name} to candidate point at ${Math.round(candidate.x)},${Math.round(candidate.y)} (${candidate.source || 'unknown'}).`)
   }
   return mapped
+}
+
+async function prepareParallelBookingRunners(context, bookingUrl, candidates) {
+  if (!candidates.length) return []
+
+  await log(`Preparing ${candidates.length} parallel booking tabs: ${candidates.map((candidate) => candidate.name).join(', ')}.`)
+  const runners = await Promise.all(candidates.map(async (candidate) => {
+    const runnerPage = await context.newPage()
+    runnerPage.setDefaultTimeout(Number(process.env.SKEDDA_TIMEOUT_MS || 20_000))
+    try {
+      await prepareBookingMap(runnerPage, bookingUrl)
+      const mapped = await mapPreferredSpacesFromMapGeometry(runnerPage)
+      const mappedCandidate = mapped.find((item) => item.name === candidate.name) || candidate
+      await log(`Prepared parallel tab for ${candidate.name} at ${Math.round(mappedCandidate.x)},${Math.round(mappedCandidate.y)}.`)
+      return { page: runnerPage, candidate: mappedCandidate }
+    } catch (error) {
+      await runnerPage.close().catch(() => {})
+      await log(`Failed to prepare parallel tab for ${candidate.name}: ${error?.message || error}`)
+      return null
+    }
+  }))
+
+  return runners.filter(Boolean)
+}
+
+async function closeParallelRunners(runners) {
+  await Promise.all(runners.map((runner) => runner.page.close().catch(() => {})))
 }
 
 async function mapPreferredSpacesFromMapGeometry(page) {
@@ -512,6 +757,10 @@ async function mapPreferredSpacesFromMapGeometry(page) {
     function isAvailableGreen(value) {
       const rgb = parseRgb(value)
       return Boolean(rgb && rgb[1] > 140 && rgb[0] < 80 && rgb[2] > 80 && rgb[2] < 190)
+    }
+    function isParkingFill(value) {
+      const rgb = parseRgb(value)
+      return Boolean(rgb && Math.max(...rgb) > 20)
     }
     function rectOf(el) {
       const rect = el.getBoundingClientRect()
@@ -537,7 +786,35 @@ async function mapPreferredSpacesFromMapGeometry(page) {
         const box = rectOf(el)
         return { ...box, fill: getComputedStyle(el).fill }
       })
-      .filter((box) => box.width > 60 && box.width < 180 && box.height > 140 && box.height < 340)
+      .filter((box) => box.width > 60 && box.width < 180 && box.height > 140 && box.height < 340 && isParkingFill(box.fill))
+
+    const labelCandidates = nodes
+      .map((el) => {
+        const text = (el.textContent || '').trim()
+        if (!/^\d{1,2}$/.test(text)) return null
+        const number = Number(text)
+        if (number < 1 || number > 25) return null
+        const box = rectOf(el)
+        return { name: text, ...box }
+      })
+      .filter(Boolean)
+      .filter((label) => label.width > 0 && label.width < 80 && label.height > 0 && label.height < 50)
+
+    const spacesByLabel = new Map()
+    for (const label of labelCandidates) {
+      const rect = parkingRects
+        .filter((candidate) => label.x >= candidate.left - 8 && label.x <= candidate.right + 8
+          && label.y >= candidate.top - 35 && label.y <= candidate.bottom + 35)
+        .sort((a, b) => Math.abs(label.y - a.bottom) - Math.abs(label.y - b.bottom)
+          || Math.abs(label.x - a.x) - Math.abs(label.x - b.x))[0]
+      if (!rect) continue
+
+      const score = Math.abs(label.y - rect.bottom) + Math.abs(label.x - rect.x)
+      const current = spacesByLabel.get(label.name)
+      if (!current || score < current.score) {
+        spacesByLabel.set(label.name, { ...rect, name: label.name, source: 'label', score })
+      }
+    }
 
     const yBuckets = []
     for (const box of parkingRects.sort((a, b) => a.y - b.y || a.x - b.x)) {
@@ -565,7 +842,10 @@ async function mapPreferredSpacesFromMapGeometry(page) {
       .slice(0, bottomLabels.length)
       .map((box, index) => ({ ...box, name: bottomLabels[index] }))
 
-    const spacesByName = new Map([...topRow, ...bottomRow].map((space) => [space.name, space]))
+    const spacesByName = new Map([...topRow, ...bottomRow].map((space) => [space.name, { ...space, source: 'row-fallback' }]))
+    for (const [name, space] of spacesByLabel) {
+      spacesByName.set(name, space)
+    }
     const greenDots = nodes
       .map((el) => {
         const box = rectOf(el)
@@ -582,7 +862,7 @@ async function mapPreferredSpacesFromMapGeometry(page) {
         .filter((candidate) => candidate.x >= space.left - 5 && candidate.x <= space.right + 5
           && candidate.y >= space.top - 5 && candidate.y <= space.bottom + 5)
         .sort((a, b) => Math.hypot(a.x - space.x, a.y - space.y) - Math.hypot(b.x - space.x, b.y - space.y))[0]
-      return dot ? { name, x: dot.x, y: dot.y } : { name, x: space.x, y: space.y }
+      return dot ? { name, x: dot.x, y: dot.y, source: space.source } : { name, x: space.x, y: space.y, source: space.source }
     }).filter(Boolean)
   }, { spaces: preferredSpaces })
 }
@@ -607,12 +887,68 @@ async function clickSpaceCandidate(page, candidate) {
   throw new Error(`No clickable coordinate for ${candidate.name}.`)
 }
 
+async function waitUntilBookingClickTime(time) {
+  const maxWaitMs = Number(process.env.SKEDDA_WAIT_BEFORE_START_MAX_MS || 120_000)
+  const waitMs = millisecondsUntilTodayTime(time)
+  if (waitMs <= 0 || waitMs > maxWaitMs) return
+
+  await log(`Map is ready; waiting ${waitMs}ms until ${time} before clicking priority spaces.`)
+  await new Promise((resolve) => setTimeout(resolve, waitMs))
+}
+
+function millisecondsUntilTodayTime(time) {
+  const [targetHour, targetMinute] = time.split(':').map(Number)
+  const nowParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date())
+  const lookup = Object.fromEntries(nowParts.map((part) => [part.type, part.value]))
+  const currentSeconds = Number(lookup.hour) * 3600 + Number(lookup.minute) * 60 + Number(lookup.second)
+  const targetSeconds = targetHour * 3600 + targetMinute * 60
+  return (targetSeconds - currentSeconds) * 1000
+}
+
+async function closeOpenPopover(page, waitMs = 100) {
+  await page.keyboard.press('Escape').catch(() => {})
+  await page.waitForTimeout(waitMs)
+}
+
 async function cancelDraftBooking(page) {
   const cancel = page.getByRole('button', { name: 'Cancel booking', exact: true })
   if (await cancel.count()) {
     await cancel.first().click().catch(() => {})
     await page.waitForTimeout(800)
   }
+}
+
+async function describeCurrentBookingBlock(page, time) {
+  const text = await visibleText(page).catch(() => '')
+  return summarizeBookingText(text, time)
+}
+
+function summarizeBookingText(text, time) {
+  const normalized = normalizeText(text)
+  const lower = normalized.toLowerCase()
+  const availableBookTimes = Array.from(new Set(
+    Array.from(normalized.matchAll(/Book for\s+(\d{2}:\d{2})/g)).map((match) => match[1]),
+  ))
+
+  if (lower.includes('not available')) return `not available for ${time}`
+  if (lower.includes('already booked')) return `already booked at ${time}`
+  if (lower.includes('conflict')) return `conflict at ${time}`
+  if (lower.includes('other available times')) {
+    return availableBookTimes.length
+      ? `no Book for ${time}; other available times: ${availableBookTimes.join(', ')}`
+      : `no Book for ${time}; Skedda showed other available times`
+  }
+  if (availableBookTimes.length) {
+    return `no Book for ${time}; available book buttons: ${availableBookTimes.join(', ')}`
+  }
+  if (lower.includes('new booking')) return `booking draft opened but start time ${time} was not available`
+  return `no Book for ${time} option found`
 }
 
 function isPreferredSpace(name) {
@@ -634,7 +970,10 @@ function sortByPreferredRectIndices(candidates) {
   })
 }
 
-async function clickBookForStart(page, time) {
+async function clickBookForStart(page, time, options = {}) {
+  const settleMs = options.settleMs ?? noBookSettleMs
+  const allowAnyBook = options.allowAnyBook ?? true
+  const waitForExactBookMs = options.waitForExactBookMs ?? 0
   const text = await visibleText(page)
   if (text.includes('New booking') && (text.includes(`From ${time}`) || page.url().includes(`nbstart=`))) {
     return true
@@ -652,13 +991,32 @@ async function clickBookForStart(page, time) {
     await page.waitForTimeout(800)
   }
 
-  const anyBook = page.getByRole('button', { name: /^Book for / })
-  if (await anyBook.count()) {
-    await anyBook.first().click()
-    return true
+  if (allowAnyBook) {
+    const anyBook = page.getByRole('button', { name: /^Book for / })
+    if (await anyBook.count()) {
+      await anyBook.first().click()
+      return true
+    }
   }
 
-  await page.waitForTimeout(2_000)
+  if (waitForExactBookMs > 0) {
+    const deadline = Date.now() + waitForExactBookMs
+    await log(`Waiting up to ${waitForExactBookMs}ms for Book for ${time} to appear without re-clicking the space.`)
+    while (Date.now() < deadline) {
+      const exact = page.getByRole('button', { name: `Book for ${time}`, exact: true })
+      if (await exact.count()) {
+        await exact.first().click()
+        return true
+      }
+      const currentText = await visibleText(page).catch(() => '')
+      if (currentText.includes('New booking') && (currentText.includes(`From ${time}`) || page.url().includes(`nbstart=`))) {
+        return true
+      }
+      await page.waitForTimeout(200)
+    }
+  }
+
+  await page.waitForTimeout(settleMs)
   const settledText = await visibleText(page)
   if (settledText.includes('New booking') && (settledText.includes(`From ${time}`) || page.url().includes('nbstart='))) {
     return true
@@ -673,18 +1031,57 @@ async function setEndTime(page, time) {
   if (normalized.includes(`to ${time}`) || normalized.includes(`${targetStart}-${time}`)) return
 
   const endButton = page.getByRole('button', { name: /^to / })
-  if (!(await endButton.count())) {
-    throw new Error('Could not find end-time button.')
+  if (await endButton.count()) {
+    await endButton.first().click()
+  } else {
+    const endCombobox = page.getByRole('combobox', { name: /^to / })
+    if (await endCombobox.count()) {
+      await endCombobox.first().click()
+    } else {
+      const clicked = await clickTextByPattern(page, /^to \d{1,2}:\d{2}$/i)
+      if (!clicked) throw new Error('Could not find end-time control.')
+    }
   }
-
-  await endButton.first().click()
   await page.waitForTimeout(500)
 
   const option = page.getByRole('button', { name: time, exact: true })
   const count = await option.count()
-  if (!count) throw new Error(`Could not find end-time option ${time}.`)
-  await option.nth(count - 1).click()
+  if (count) {
+    await option.nth(count - 1).click()
+  } else {
+    const optionByText = await clickTextByPattern(page, new RegExp(`^${escapeRegExp(time)}$`))
+    if (!optionByText) throw new Error(`Could not find end-time option ${time}.`)
+  }
   await page.waitForTimeout(1_000)
+}
+
+async function clickTextByPattern(page, pattern) {
+  const target = await page.evaluate((source) => {
+    const regex = new RegExp(source, 'i')
+    const matches = Array.from(document.querySelectorAll('body *'))
+      .map((el) => {
+        const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')
+        const rect = el.getBoundingClientRect()
+        const style = getComputedStyle(el)
+        return {
+          text,
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+          area: rect.width * rect.height,
+          visible: rect.width > 0 && rect.height > 0
+            && rect.bottom > 0 && rect.right > 0
+            && rect.top < window.innerHeight && rect.left < window.innerWidth
+            && style.visibility !== 'hidden'
+            && style.display !== 'none',
+        }
+      })
+      .filter((item) => item.visible && regex.test(item.text))
+      .sort((a, b) => a.area - b.area)
+    return matches[0] || null
+  }, pattern.source)
+  if (!target) return false
+  await page.mouse.click(target.x, target.y)
+  return true
 }
 
 async function fillVehicleDetails(page) {
@@ -747,18 +1144,59 @@ function extractSpaceName(text) {
 
 function classifyOutcome(text) {
   const lower = text.toLowerCase()
+  const existingBooking = findExistingTargetBooking(text)
   if (
     lower.includes('too easy')
     || lower.includes('your booking is in')
     || lower.includes('confirmation email will hit your inbox')
     || lower.includes('booking confirmed')
   ) {
-    return { success: true, status: 'confirmed', subject: 'confirmed', message: 'Skedda showed the success confirmation popup.' }
+    return { success: true, status: 'confirmed', subject: 'confirmed', message: 'Skedda showed the success confirmation popup.', bookedSpace: existingBooking?.space || null }
+  }
+  if (lower.includes('quota is exceeded') && existingBooking) {
+    return {
+      success: true,
+      status: 'confirmed-existing-booking',
+      subject: 'confirmed existing booking',
+      message: `Skedda says the quota is exceeded because a booking already exists for ${target.date} ${targetStart}-${targetEnd}${existingBooking.space ? ` in space ${existingBooking.space}` : ''}.`,
+      bookedSpace: existingBooking.space || null,
+    }
   }
   if (lower.includes('not available') || lower.includes('conflict') || lower.includes('already booked')) {
     return { success: false, status: 'confirmed-clicked-conflict', subject: 'confirm clicked, conflict shown', message: 'Confirm was clicked and Skedda showed a conflict/unavailable message.' }
   }
   return { success: false, status: 'confirm-clicked', subject: 'confirm clicked', message: 'Confirm was clicked; review screenshot/body text for the final Skedda state.' }
+}
+
+function findExistingTargetBooking(text) {
+  const lines = text.split('\n').map((line) => normalizeText(line)).filter(Boolean)
+  const targetDate = new Date(`${target.date}T00:00:00`)
+  const day = targetDate.getDate()
+  const shortMonth = targetDate.toLocaleString('en-GB', { month: 'short', timeZone: timezone }).toLowerCase()
+  const dayMonth = `${day} ${shortMonth}`
+  const slashDate = `${String(day).padStart(2, '0')}/${String(targetDate.getMonth() + 1).padStart(2, '0')}/${targetDate.getFullYear()}`
+  const lowerText = normalizeText(text).toLowerCase()
+  const quotaMatchesTarget = lowerText.includes('quota is exceeded') && lowerText.includes(slashDate)
+
+  for (const line of lines) {
+    const lowerLine = line.toLowerCase()
+    const isTargetDate = lowerLine.includes(dayMonth) || lowerLine.includes(slashDate)
+    if (!isTargetDate || !line.includes(targetStart) || !line.includes('|')) continue
+    return { line, space: parseSpaceFromBookingLine(line) }
+  }
+
+  if (quotaMatchesTarget) {
+    const bookingLine = lines.find((line) => line.includes(targetStart) && line.includes('|'))
+    if (bookingLine) return { line: bookingLine, space: parseSpaceFromBookingLine(bookingLine) }
+    return { line: null, space: null }
+  }
+
+  return null
+}
+
+function parseSpaceFromBookingLine(line) {
+  const match = line.match(/\|\s*([A-Z]?\d+)\s*$/i)
+  return match ? match[1].toUpperCase() : null
 }
 
 async function visibleText(page) {
@@ -869,7 +1307,16 @@ async function finish({ status, subject, lines, attachments = [] }) {
     ...lines,
   ].join('\n')
   await log(body)
-  await sendMail(subject, body, attachments)
+  const logContent = await fs.readFile(logPath, 'utf8').catch((error) => `Could not read run log: ${error?.message || error}`)
+  const mailBody = [
+    body,
+    '',
+    '--- Run log ---',
+    `Log file: ${logPath}`,
+    '',
+    logContent.trim(),
+  ].join('\n')
+  await sendMail(subject, mailBody, attachments)
 }
 
 async function writeSuccessMarker(result) {
@@ -879,6 +1326,7 @@ async function writeSuccessMarker(result) {
     status: result.status,
     subject: result.subject,
     screenshotPath: result.screenshotPath || null,
+    bookedSpace: result.bookedSpace || null,
     run: new Date().toISOString(),
   }
   await fs.writeFile(successMarkerPath, JSON.stringify(payload, null, 2), 'utf8')

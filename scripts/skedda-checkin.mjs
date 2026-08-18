@@ -13,7 +13,7 @@ const logDir = path.join(rootDir, 'logs', 'skedda')
 const timezone = process.env.SKEDDA_TIMEZONE || 'Europe/Amsterdam'
 const browserDebugPort = Number(process.env.SKEDDA_BROWSER_DEBUG_PORT || 9223)
 const headless = (process.env.SKEDDA_HEADLESS || 'false').toLowerCase() !== 'false'
-const checkinName = process.env.SKEDDA_CHECKIN_NAME || 'Tianshen Xue'
+const checkinName = process.env.SKEDDA_CHECKIN_NAME || 'Your Name'
 const targetDate = process.env.SKEDDA_CHECKIN_DATE || todayInTimezone(new Date())
 const forceCheckin = ['1', 'true', 'yes'].includes((process.env.SKEDDA_CHECKIN_FORCE || '').toLowerCase())
 const skipDates = (process.env.SKEDDA_CHECKIN_SKIP_DATES || '')
@@ -97,11 +97,13 @@ function buildCheckinUrl(date) {
 }
 
 async function performCheckIn(page) {
+  const bookingInfo = await findMyBookingInfo(page)
+  await log(`Today booking info: ${formatBookingInfo(bookingInfo)}`)
   await clickMyBooking(page)
 
   let currentText = await visibleText(page)
   if (isCheckedInText(currentText)) {
-    return await checkinSuccess(page, 'Already checked in.')
+    return await checkinSuccess(page, 'Already checked in.', bookingInfo)
   }
 
   const manage = page.getByRole('button', { name: /Manage/i })
@@ -109,11 +111,12 @@ async function performCheckIn(page) {
     const screenshot = await saveScreenshot(page, 'checkin-no-manage')
     return {
       status: 'no-manage',
-      subject: 'Skedda check-in: Manage not found',
+      subject: subjectWithSpace('Skedda check-in: Manage not found', bookingInfo),
       screenshotPath: screenshot,
       exitCode: 1,
       lines: [
         `Found/clicked booking name "${checkinName}" for ${targetDate}, but Manage button was not found.`,
+        formatBookingInfo(bookingInfo),
         `Screenshot: ${screenshot}`,
       ],
     }
@@ -127,11 +130,12 @@ async function performCheckIn(page) {
     const screenshot = await saveScreenshot(page, 'checkin-menu-no-item')
     return {
       status: 'check-in-not-found',
-      subject: 'Skedda check-in unavailable',
+      subject: subjectWithSpace('Skedda check-in unavailable', bookingInfo),
       screenshotPath: screenshot,
       exitCode: 1,
       lines: [
         `Manage menu opened for "${checkinName}", but Check in was not found.`,
+        formatBookingInfo(bookingInfo),
         `Screenshot: ${screenshot}`,
       ],
     }
@@ -145,11 +149,12 @@ async function performCheckIn(page) {
     const screenshot = await saveScreenshot(page, 'checkin-unavailable')
     return {
       status: 'check-in-unavailable',
-      subject: 'Skedda check-in unavailable',
+      subject: subjectWithSpace('Skedda check-in unavailable', bookingInfo),
       screenshotPath: screenshot,
       exitCode: 1,
       lines: [
         `Check-in is not available for "${checkinName}" on ${targetDate}.`,
+        formatBookingInfo(bookingInfo),
         `Screenshot: ${screenshot}`,
         '',
         clipText(afterMenuText, 1800),
@@ -162,7 +167,7 @@ async function performCheckIn(page) {
     await page.waitForTimeout(1_000)
     currentText = await visibleText(page)
     if (isCheckedInText(currentText)) {
-      return await checkinSuccess(page, 'Clicked Yes, do it and Skedda showed checked-in status.')
+      return await checkinSuccess(page, 'Clicked Yes, do it and Skedda showed checked-in status.', bookingInfo)
     }
   }
 
@@ -174,11 +179,12 @@ async function performCheckIn(page) {
     const screenshot = await saveScreenshot(page, 'checkin-modal-no-button')
     return {
       status: 'check-in-button-not-found',
-      subject: 'Skedda check-in button not found',
+      subject: subjectWithSpace('Skedda check-in button not found', bookingInfo),
       screenshotPath: screenshot,
       exitCode: 1,
       lines: [
         'Check-in dialog opened, but final Check in button was not found.',
+        formatBookingInfo(bookingInfo),
         `Screenshot: ${screenshot}`,
       ],
     }
@@ -194,11 +200,12 @@ async function performCheckIn(page) {
 
   return {
     status: success ? 'checked-in' : 'check-in-submitted',
-    subject: success ? 'Skedda checked in' : 'Skedda check-in submitted',
+    subject: subjectWithSpace(success ? 'Skedda checked in' : 'Skedda check-in submitted', bookingInfo),
     screenshotPath: screenshot,
     exitCode: success ? 0 : 1,
     lines: [
       `Clicked Check in for "${checkinName}" on ${targetDate}.`,
+      formatBookingInfo(bookingInfo),
       `Screenshot: ${screenshot}`,
       '',
       clipText(text, 1800),
@@ -206,16 +213,17 @@ async function performCheckIn(page) {
   }
 }
 
-async function checkinSuccess(page, message) {
+async function checkinSuccess(page, message, bookingInfo) {
   const screenshot = await saveScreenshot(page, 'checkin-success')
   const text = await visibleText(page)
   return {
     status: 'checked-in',
-    subject: 'Skedda checked in',
+    subject: subjectWithSpace('Skedda checked in', bookingInfo),
     screenshotPath: screenshot,
     exitCode: 0,
     lines: [
       `${message} "${checkinName}" on ${targetDate}.`,
+      formatBookingInfo(bookingInfo),
       `Screenshot: ${screenshot}`,
       '',
       clipText(text, 1800),
@@ -230,6 +238,77 @@ function isCheckedInText(text) {
 async function clickMyBooking(page) {
   await clickVisibleText(page, checkinName, `booking name "${checkinName}"`)
   await page.waitForTimeout(800)
+}
+
+async function findMyBookingInfo(page) {
+  return await page.evaluate((name) => {
+    const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim()
+    const isVisible = (el, rect) => {
+      const style = getComputedStyle(el)
+      return rect.width > 0 && rect.height > 0
+        && rect.bottom > 0 && rect.right > 0
+        && rect.top < window.innerHeight && rect.left < window.innerWidth
+        && style.visibility !== 'hidden'
+        && style.display !== 'none'
+    }
+    const items = Array.from(document.querySelectorAll('body *'))
+      .map((el) => {
+        const text = normalize(el.innerText || el.textContent)
+        const rect = el.getBoundingClientRect()
+        return {
+          text,
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+          left: rect.left,
+          right: rect.right,
+          width: rect.width,
+          height: rect.height,
+          area: rect.width * rect.height,
+          visible: text && isVisible(el, rect),
+        }
+      })
+      .filter((item) => item.visible && item.text.length <= 120)
+
+    const nameMatch = items
+      .filter((item) => item.text.includes(name))
+      .sort((a, b) => a.area - b.area)[0]
+    if (!nameMatch) return { space: 'unknown', time: 'unknown', matchedName: name }
+
+    const sameRow = items
+      .filter((item) => Math.abs(item.y - nameMatch.y) <= 14 && item.right <= nameMatch.left + 30)
+      .sort((a, b) => a.x - b.x)
+
+    const timeMatch = sameRow.find((item) => /^\d{1,2}:\d{2}\s*[–-]\s*\d{1,2}:\d{2}/.test(item.text))
+    const spaceMatch = sameRow
+      .filter((item) => /^(?:Z)?\d{1,3}$/i.test(item.text))
+      .sort((a, b) => b.x - a.x)[0]
+
+    return {
+      space: spaceMatch ? spaceMatch.text.toUpperCase().replace(/^Z/, '') : 'unknown',
+      time: timeMatch ? timeMatch.text : 'unknown',
+      matchedName: nameMatch.text,
+    }
+  }, checkinName).catch((error) => ({
+    space: 'unknown',
+    time: 'unknown',
+    matchedName: checkinName,
+    error: error?.message || String(error),
+  }))
+}
+
+function formatBookingInfo(info) {
+  const parts = [
+    `Today parking: Space ${info?.space || 'unknown'}`,
+    `Parking space: ${info?.space || 'unknown'}`,
+    `Booking time: ${info?.time || 'unknown'}`,
+  ]
+  if (info?.error) parts.push(`Booking info error: ${info.error}`)
+  return parts.join('\n')
+}
+
+function subjectWithSpace(subject, info) {
+  const space = info?.space && info.space !== 'unknown' ? ` - Space ${info.space}` : ''
+  return `${subject}${space}`
 }
 
 async function clickVisibleText(page, textToFind, label) {
@@ -323,7 +402,9 @@ async function openBrowserSession() {
 async function waitForCdpEndpoint(endpoint) {
   const deadline = Date.now() + Number(process.env.SKEDDA_CDP_START_TIMEOUT_MS || 30_000)
   while (Date.now() < deadline) {
-    const ok = await fetch(`${endpoint}/json/version`).then((response) => response.ok).catch(() => false)
+    const ok = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(1_500) })
+      .then((response) => response.ok)
+      .catch(() => false)
     if (ok) return
     await new Promise((resolve) => setTimeout(resolve, 500))
   }

@@ -1,13 +1,17 @@
 {
   "name": "zeekr-parking",
-  "private": true,
+  "private": false,
   "version": "1.0.0",
   "type": "module",
   "scripts": {
     "skedda:login": "node scripts/skedda-login.mjs",
     "skedda:book": "node scripts/skedda-booking.mjs",
+    "skedda:book:mad": "node scripts/skedda-booking.mjs --mad",
+    "skedda:modify": "node scripts/skedda-modify-booking.mjs",
     "skedda:checkin": "node scripts/skedda-checkin.mjs",
     "skedda:task": "powershell -ExecutionPolicy Bypass -File scripts/register-skedda-task.ps1",
+    "skedda:task:mad": "powershell -ExecutionPolicy Bypass -File scripts/register-skedda-task.ps1 -MadMode",
+    "skedda:modify-task": "powershell -ExecutionPolicy Bypass -File scripts/register-skedda-modify-task.ps1",
     "skedda:checkin-task": "powershell -ExecutionPolicy Bypass -File scripts/register-skedda-checkin-task.ps1"
   },
   "dependencies": {

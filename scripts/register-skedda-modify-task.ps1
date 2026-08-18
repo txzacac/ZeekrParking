@@ -1,14 +1,13 @@
 param(
-  [string]$TriggerTime = "08:05",
-  [string]$SkipDates = ""
+  [string]$TriggerTime = "09:30"
 )
 
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$taskName = "SkeddaParkingCheckIn"
-$scriptPath = Join-Path $repoRoot "scripts\skedda-checkin.mjs"
-$runnerPath = Join-Path $repoRoot "scripts\run-skedda-checkin.ps1"
+$taskName = "SkeddaParkingModify"
+$scriptPath = Join-Path $repoRoot "scripts\skedda-modify-booking.mjs"
+$runnerPath = Join-Path $repoRoot "scripts\run-skedda-modify.ps1"
 $powershell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 if (-not (Test-Path $scriptPath)) {
@@ -19,9 +18,6 @@ if (-not (Test-Path $runnerPath)) {
 }
 
 $actionArguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runnerPath`""
-if ($SkipDates) {
-  $actionArguments = "$actionArguments -SkipDates `"$SkipDates`""
-}
 $action = New-ScheduledTaskAction -Execute $powershell -Argument $actionArguments -WorkingDirectory $repoRoot
 $triggerAt = [datetime]::ParseExact($TriggerTime, "HH:mm", [Globalization.CultureInfo]::InvariantCulture)
 $trigger = New-ScheduledTaskTrigger -Daily -At $triggerAt
@@ -37,7 +33,7 @@ Register-ScheduledTask `
   -Action $action `
   -Trigger $trigger `
   -Settings $settings `
-  -Description "Check in to today's Zeekr Skedda parking booking. Trigger time is $TriggerTime." `
+  -Description "Modify tomorrow's Zeekr Skedda parking booking. Trigger time is $TriggerTime; target booking time is configured in .env." `
   -Force | Out-Null
 
 Write-Host "Registered scheduled task: $taskName"

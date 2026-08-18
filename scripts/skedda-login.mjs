@@ -77,7 +77,9 @@ async function openBrowser() {
 async function waitForCdpEndpoint(endpoint) {
   const deadline = Date.now() + Number(process.env.SKEDDA_CDP_START_TIMEOUT_MS || 30_000)
   while (Date.now() < deadline) {
-    const ok = await fetch(`${endpoint}/json/version`).then((response) => response.ok).catch(() => false)
+    const ok = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(1_500) })
+      .then((response) => response.ok)
+      .catch(() => false)
     if (ok) return
     await new Promise((resolve) => setTimeout(resolve, 500))
   }

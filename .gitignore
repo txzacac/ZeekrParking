@@ -2,4 +2,5 @@ logs
 *.log
 .skedda-profile
 node_modules
+.env
 .env.local
